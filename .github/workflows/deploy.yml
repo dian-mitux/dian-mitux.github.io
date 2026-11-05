@@ -1,0 +1,54 @@
+name: Deploy site
+
+on:
+  schedule:
+    - cron: "17 9 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+  actions: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Check out site source
+        uses: actions/checkout@v4
+        with:
+          repository: dian-mitux/portfolio-site
+          ssh-key: ${{ secrets.SITE_DEPLOY_KEY }}
+          path: src
+          persist-credentials: false
+
+      - name: Refresh contribution calendar
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: python3 src/scripts/refresh_contributions.py dian-mitux
+
+      - name: Assemble site
+        run: |
+          mkdir _site
+          cp -R src/index.html src/assets src/data _site/
+
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: _site
+
+      - id: deployment
+        uses: actions/deploy-pages@v4
+
+      # Public repos lose their schedule after 60 days without commits; re-enabling resets the timer.
+      - name: Keep the weekly schedule enabled
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh api -X PUT "repos/${{ github.repository }}/actions/workflows/deploy.yml/enable"
