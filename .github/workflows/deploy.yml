@@ -6,10 +6,9 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: read
+  contents: write
   pages: write
   id-token: write
-  actions: write
 
 concurrency:
   group: pages
@@ -40,15 +39,39 @@ jobs:
           mkdir _site
           cp -R src/index.html src/assets src/data _site/
 
-      - uses: actions/upload-pages-artifact@v3
+      - id: upload
+        uses: actions/upload-pages-artifact@v3
         with:
           path: _site
 
+      # Pages keeps serving the old site when a build version repeats, and the version must be a commit in
+      # this repo (actions/deploy-pages#383). This repo rarely changes, so each run deploys under a new empty commit.
       - id: deployment
-        uses: actions/deploy-pages@v4
-
-      # Public repos lose their schedule after 60 days without commits; re-enabling resets the timer.
-      - name: Keep the weekly schedule enabled
+        uses: actions/github-script@v7
         env:
-          GH_TOKEN: ${{ github.token }}
-        run: gh api -X PUT "repos/${{ github.repository }}/actions/workflows/deploy.yml/enable"
+          ARTIFACT_ID: ${{ steps.upload.outputs.artifact_id }}
+        with:
+          script: |
+            const { owner, repo } = context.repo;
+            const { data: ref } = await github.rest.git.getRef({ owner, repo, ref: 'heads/main' });
+            const { data: parent } = await github.rest.git.getCommit({ owner, repo, commit_sha: ref.object.sha });
+            const { data: commit } = await github.rest.git.createCommit({
+              owner, repo, message: `chore: 发布 ${new Date().toISOString()}`, tree: parent.tree.sha, parents: [parent.sha],
+            });
+            await github.rest.git.updateRef({ owner, repo, ref: 'heads/main', sha: commit.sha });
+            const { data } = await github.request('POST /repos/{owner}/{repo}/pages/deployments', {
+              owner, repo,
+              artifact_id: Number(process.env.ARTIFACT_ID),
+              pages_build_version: commit.sha,
+              oidc_token: await core.getIDToken(),
+            });
+            core.setOutput('page_url', data.page_url);
+            const FINAL_ERRORS = ['deployment_failed', 'deployment_content_failed', 'deployment_cancelled', 'deployment_lost'];
+            for (let i = 0; i < 120; i++) {
+              const { data: d } = await github.request('GET /repos/{owner}/{repo}/pages/deployments/{id}', { owner, repo, id: data.id });
+              core.info(`Pages deployment ${commit.sha.slice(0, 7)}: ${d.status}`);
+              if (d.status === 'succeed') return;
+              if (FINAL_ERRORS.includes(d.status)) throw new Error(`Pages deployment ${d.status}`);
+              await new Promise(r => setTimeout(r, 5000));
+            }
+            throw new Error('Pages deployment did not finish in 10 minutes');
